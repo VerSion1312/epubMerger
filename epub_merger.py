@@ -32,6 +32,8 @@ class EpubMerger:
         self.id_mapping = {}  # 原始ID -> 新ID
         # 添加语言设置
         self.language = language
+        # 添加文件名计数器，避免重名
+        self.filename_counter = {}
         
     def extract_epub(self, epub_path: str) -> str:
         """解压EPUB文件到临时目录"""
@@ -118,7 +120,56 @@ class EpubMerger:
             shutil.copy2(source_full, target_full)
             logger.info(f"复制资源: {source_path} -> {target_path}")
     
-    def update_html_references(self, html_content: str, base_path: str, all_resources: Dict) -> str:
+    def normalize_path(self, path: str, base_path: str) -> str:
+        """标准化路径，处理各种相对路径情况"""
+        if not path:
+            return path
+            
+        original_path = path
+        
+        # 移除开头的 './'
+        if path.startswith('./'):
+            path = path[2:]
+        
+        # 处理绝对路径（相对于EPUB根目录）
+        if path.startswith('/'):
+            path = path[1:]
+        
+        # 处理包含 '../' 的路径
+        if '../' in path:
+            # 计算相对路径
+            path_parts = path.split('/')
+            base_parts = base_path.split(os.sep)
+            
+            # 移除路径中的 '..'
+            while path_parts and path_parts[0] == '..':
+                path_parts.pop(0)
+                if base_parts:
+                    base_parts.pop()
+            
+            # 重新组合路径
+            if base_parts:
+                path = os.path.join(*base_parts, *path_parts)
+            else:
+                path = '/'.join(path_parts)
+        
+        # 统一路径分隔符为 '/'
+        path = path.replace('\\', '/')
+        
+        logger.debug(f"路径标准化: {original_path} -> {path}")
+        return path
+    
+    def get_unique_filename(self, original_filename: str) -> str:
+        """生成唯一的文件名，避免重名冲突"""
+        name, ext = os.path.splitext(original_filename)
+        if original_filename not in self.filename_counter:
+            self.filename_counter[original_filename] = 1
+            return original_filename
+        else:
+            self.filename_counter[original_filename] += 1
+            return f"{name}_{self.filename_counter[original_filename]}{ext}"
+    
+    def update_html_references(self, html_content: str, base_path: str, resource_mapping: Dict) -> str:
         """更新HTML文件中的资源引用"""
         if not html_content:
             return html_content
@@ -133,17 +184,32 @@ class EpubMerger:
                 
                 # 解析相对路径
                 try:
-                    # 获取相对于base_path的完整路径
-                    if os.path.isabs(src):
-                        relative_path = os.path.relpath(src, base_path)
-                    else:
-                        relative_path = src
+                    # 标准化路径
+                    normalized_path = self.normalize_path(src, base_path)
                     
                     # 查找对应的新路径
-                    if relative_path in self.resource_mapping:
-                        new_path = self.resource_mapping[relative_path]
+                    if normalized_path in resource_mapping:
+                        new_path = resource_mapping[normalized_path]
                         logger.info(f"更新图片引用: {src} -> {new_path}")
                         return f'src="{new_path}"'
+                    else:
+                        # 尝试其他可能的路径变体
+                        possible_paths = [
+                            normalized_path,
+                            src,
+                            src.lstrip('./'),
+                            src.lstrip('/'),
+                            os.path.basename(src)
+                        ]
+                        
+                        for test_path in possible_paths:
+                            if test_path in resource_mapping:
+                                new_path = resource_mapping[test_path]
+                                logger.info(f"更新图片引用(变体): {src} -> {new_path}")
+                                return f'src="{new_path}"'
+                        
+                        logger.warning(f"未找到资源映射: {normalized_path} (原始: {src})")
+                        logger.debug(f"可用的资源映射键: {list(resource_mapping.keys())[:10]}...")
                 except Exception as e:
                     logger.warning(f"更新图片引用失败: {src}, 错误: {e}")
             
@@ -162,15 +228,30 @@ class EpubMerger:
                     return match.group(0)  # 锚点链接，保持不变
                 
                 try:
-                    if os.path.isabs(clean_url):
-                        relative_path = os.path.relpath(clean_url, base_path)
-                    else:
-                        relative_path = clean_url
+                    # 标准化路径
+                    normalized_path = self.normalize_path(clean_url, base_path)
                     
-                    if relative_path in self.resource_mapping:
-                        new_path = self.resource_mapping[relative_path]
+                    if normalized_path in resource_mapping:
+                        new_path = resource_mapping[normalized_path]
                         logger.info(f"更新CSS背景图片: {clean_url} -> {new_path}")
                         return f'url("{new_path}")'
+                    else:
+                        # 尝试其他可能的路径变体
+                        possible_paths = [
+                            normalized_path,
+                            clean_url,
+                            clean_url.lstrip('./'),
+                            clean_url.lstrip('/'),
+                            os.path.basename(clean_url)
+                        ]
+                        
+                        for test_path in possible_paths:
+                            if test_path in resource_mapping:
+                                new_path = resource_mapping[test_path]
+                                logger.info(f"更新CSS背景图片(变体): {clean_url} -> {new_path}")
+                                return f'url("{new_path}")'
+                        
+                        logger.warning(f"未找到CSS资源映射: {normalized_path} (原始: {clean_url})")
                 except Exception as e:
                     logger.warning(f"更新CSS背景图片失败: {clean_url}, 错误: {e}")
             
@@ -209,6 +290,11 @@ class EpubMerger:
             all_manifest = {}
             all_resources = {}
             
+            # 重置全局资源映射
+            self.resource_mapping = {}
+            self.id_mapping = {}
+            self.filename_counter = {}
+            
             for i, epub_file in enumerate(epub_files):
                 logger.info(f"处理第 {i+1} 个文件: {epub_file}")
                 
@@ -233,13 +319,19 @@ class EpubMerger:
                             new_id = f"item_{self.resource_counter:04d}"
                             self.resource_counter += 1
                             
+                            # 生成唯一的文件名
+                            original_filename = os.path.basename(href)
+                            unique_filename = self.get_unique_filename(original_filename)
+                            new_href = f"resources/{unique_filename}"
+                            
                             # 复制文件到resources目录
-                            new_href = f"resources/{os.path.basename(href)}"
                             self.copy_resource(base_path, href, merged_temp_dir, new_href)
                             
-                            # 建立映射关系
+                            # 建立映射关系（使用文件内的相对路径）
                             self.resource_mapping[href] = new_href
                             self.id_mapping[item_id] = new_id
+                            
+                            logger.info(f"资源映射: {href} -> {new_href} (类型: {media_type})")
                             
                             all_resources[new_id] = {
                                 'href': new_href,
@@ -263,7 +355,9 @@ class EpubMerger:
                             
                             # 如果是HTML文件，需要更新资源引用
                             if media_type == 'application/xhtml+xml':
-                                content = self.update_html_references(content, base_path, all_resources)
+                                logger.info(f"处理HTML文件: {href}")
+                                # 使用全局资源映射
+                                content = self.update_html_references(content, base_path, self.resource_mapping)
                             
                             # 保存到合并的资源中
                             all_resources[new_id] = {
